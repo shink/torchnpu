@@ -8,10 +8,22 @@ import warnings
 
 from functools import wraps
 
+# Disable autoloading before running 'import torch' to avoid circular dependencies
+ORG_AUTOLOAD = os.getenv("TORCH_DEVICE_BACKEND_AUTOLOAD", "1")
+os.environ["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"
+
 import torch
 from torch.distributed.fsdp import sharded_grad_scaler
 from torch.utils.checkpoint import DefaultDeviceType
 import torch_npu
+
+acc = torch._C._get_accelerator()
+if acc.type != 'cpu':
+    raise RuntimeError(f"Two accelerators cannot be used at the same time "
+                       f"in PyTorch: npu and {acc.type}. You can install "
+                       f"the cpu version of PyTorch to use your npu device, "
+                       f"or use the {acc.type} device with "
+                       f"'export TORCH_DEVICE_BACKEND_AUTOLOAD=0'.")
 
 try:
     import torch_npu.npu
@@ -234,3 +246,11 @@ if hasattr(sys, 'ps1'):
     os.environ["TASK_QUEUE_ENABLE"] = '0'
     warnings.warn("On the interactive interface, the value of TASK_QUEUE_ENABLE is set to 0 by default. \
                      Do not set it to 1 to prevent some unknown errors")
+
+
+# This function is an entrypoint called by PyTorch
+# when running 'import torch'. There is no need to do anything.
+# See this RFC: https://github.com/pytorch/pytorch/pull/127074
+def _autoload():
+    # We should restore this switch as sub processes need to inherit its value
+    os.environ["TORCH_DEVICE_BACKEND_AUTOLOAD"] = ORG_AUTOLOAD
