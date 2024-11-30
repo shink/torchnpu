@@ -201,6 +201,11 @@ def run_test(test, test_directory, options):
 
     if options.verbose:
         unittest_args.append("-v")
+
+    # Enable autoloading
+    env = os.environ.copy()
+    env["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "1"
+
     # get python cmd.
     executable = [sys.executable]
 
@@ -210,7 +215,7 @@ def run_test(test, test_directory, options):
 
     command = executable + argv
     print_to_stderr("Executing {} ... [{}]".format(command, datetime.now(tz=timezone.utc)))
-    return shell(command, test_directory)
+    return shell(command, cwd=test_directory, env=env)
 
 
 def run_distributed_test(test, test_directory, options):
