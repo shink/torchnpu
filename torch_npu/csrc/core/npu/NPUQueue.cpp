@@ -308,7 +308,8 @@ bool Repository::WriteQueue(void* cur_paras) {
     if (GetStatus() == RepoStatus::STOP_EXIT) {
         auto queueParam = static_cast<c10_npu::queue::QueueParas *>(cur_paras);
         auto type = queueParam->paramType;
-        if (type == c10_npu::queue::LAZY_DESTROY_EVENT) {
+        // The RECORD_EVENT in the destructor process should not throw an exception.
+        if (type == c10_npu::queue::LAZY_DESTROY_EVENT || type == c10_npu::queue::RECORD_EVENT) {
             return true;
         } else {
             ASCEND_LOGE("getRepoStopFlag in WriteQueue, throw FORCE STOP.");
@@ -392,13 +393,21 @@ void Repository::Enqueue(void* cur_paras) {
   }
 
     if (GetStatus() == RepoStatus::UCE_EXIT) {
+        auto queueParam = static_cast<c10_npu::queue::QueueParas *>(cur_paras);
+        auto type = queueParam->paramType;
+        // The RECORD_EVENT in the destructor process should not throw an exception.
+        if (type == c10_npu::queue::LAZY_DESTROY_EVENT || type == c10_npu::queue::RECORD_EVENT) {
+            return;
+        }
+        ASCEND_LOGE("getUceErrorFlag in Enqueue, throw UCE ERROR.");
         throw std::runtime_error("UCE ERROR" + PTA_ERROR(ErrCode::ACL));
     }
 
     if (GetStatus() == RepoStatus::STOP_EXIT) {
         auto queueParam = static_cast<c10_npu::queue::QueueParas *>(cur_paras);
         auto type = queueParam->paramType;
-        if (type == c10_npu::queue::LAZY_DESTROY_EVENT) {
+        // The RECORD_EVENT in the destructor process should not throw an exception.
+        if (type == c10_npu::queue::LAZY_DESTROY_EVENT || type == c10_npu::queue::RECORD_EVENT) {
             return;
         }
         ASCEND_LOGE("getRepoStopFlag in Enqueue, throw FORCE STOP.");
@@ -519,6 +528,10 @@ void Repository::Dequeue() {
       if (GetStatus() == RepoStatus::ERROR_EXIT) {
         break;
       }
+
+        if (GetStatus() == RepoStatus::STOP_EXIT) {
+            continue;
+        }
 
       SetReadWorking(false);
       __sync_synchronize();

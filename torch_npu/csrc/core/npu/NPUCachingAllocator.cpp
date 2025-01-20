@@ -1006,7 +1006,7 @@ class DeviceCachingAllocator {
             "Get a block from the existing pool failed. Try to free cached blocks and reallocate. This error log "
             "can be ignored.");
         // Free all non-split cached blocks and retry alloc.
-        c10_npu::NPUWorkspaceAllocator::emptyCache(true);
+        c10_npu::NPUWorkspaceAllocator::emptyCache(device, true);
         block_found = (release_cached_blocks(true, context) && alloc_block(params, true, context, lock));
     }
 
@@ -1342,13 +1342,14 @@ class DeviceCachingAllocator {
     set_fraction = true;
   }
 
-  /** returns cached blocks to the system allocator **/
-  void emptyCache(bool check_error) {
-    std::shared_ptr<c10::GatheredContext> context =
-        maybeGatherContext(RecordContext::ALL);
-    std::lock_guard<std::recursive_mutex> lock(mutex);
-    release_cached_blocks(check_error, context);
-  }
+    /** returns cached blocks to the system allocator **/
+    void emptyCache(int device, bool check_error)
+    {
+        std::shared_ptr<c10::GatheredContext> context = maybeGatherContext(RecordContext::ALL);
+        std::lock_guard<std::recursive_mutex> lock(mutex);
+        c10_npu::NPUWorkspaceAllocator::emptyCache(device, check_error);
+        release_cached_blocks(check_error, context);
+    }
 
   void release_and_free_events()
   {
@@ -1973,7 +1974,6 @@ class DeviceCachingAllocator {
     }
 
     if (p.err != ACL_ERROR_NONE) {
-      p.err = ACL_ERROR_RT_MEMORY_ALLOCATION;
       return false;
     }
     ASCEND_LOGD("NPUCachingAllocator malloc by AclrtMallocAlign32: size=%zu", size);
@@ -2522,7 +2522,7 @@ class NpuCachingAllocator : public NPUAllocator {
   {
     int count = static_cast<int>(device_allocator.size());
     for (int i = 0; i < count; i++)
-      device_allocator[i]->emptyCache(check_error);
+      device_allocator[i]->emptyCache(i, check_error);
   }
 
   void* getBaseAllocation(void* ptr, size_t* outSize) override
@@ -2603,6 +2603,10 @@ class NpuCachingAllocator : public NPUAllocator {
 
   c10::DataPtr allocate(size_t size) override
   {
+      constexpr size_t one_exa_bytes = 1152921504606846976ULL;
+      if (size >= one_exa_bytes) {
+          AT_ERROR("NPU out of memory. Tried to allocate more than 1EB memory.");
+      }
       int device = 0;
       NPU_CHECK_ERROR(c10_npu::GetDevice(&device));
       void* devPtr = nullptr;
@@ -2694,7 +2698,7 @@ class NpuCachingAllocator : public NPUAllocator {
 
   void FreeDeviceCachedMemory(int device) override
   {
-    device_allocator[device]->emptyCache(true);
+    device_allocator[device]->emptyCache(device, true);
   }
 
   std::string name() override

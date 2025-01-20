@@ -145,7 +145,7 @@ public:
         std::vector<at::Tensor> result() override;
 
         // Extend tensors lifecycle to work.synchronize, the tensors is local
-        // variable and recordStream.  
+        // variable and recordStream.
         void lazyDestroy(std::vector<at::Tensor> tensors);
 
         // Helper function that sets an exception_ptr on the WorkHCCL object.
@@ -335,6 +335,18 @@ public:
 	    std::vector<uint32_t> remote_rank_list);
 
     at::Tensor byte_alignment(at::Tensor& tensors);
+
+    c10::intrusive_ptr<c10d::Work> _reduce_scatter_base_uneven(
+        at::Tensor& outputTensor,
+        at::Tensor& inputTensor,
+        std::vector<int64_t>& inputSplitSizes,
+        const c10d::ReduceScatterOptions& opts);
+
+    c10::intrusive_ptr<c10d::Work> _allgather_base_uneven(
+        at::Tensor& outputTensor,
+        at::Tensor& inputTensor,
+        std::vector<int64_t>& outputSplitSizes,
+        const c10d::AllgatherOptions& opts);
 
     c10::intrusive_ptr<c10d::Work> allgather(
         std::vector<std::vector<at::Tensor>>& outputTensors,
@@ -636,6 +648,32 @@ protected:
     uint64_t op_id_{0};
 
     std::exception_ptr watchDogException_ = nullptr;
+
+    struct StatusStruct {
+        int seq = 0;
+        std::string pgId;
+        std::string opType;
+        std::string commIds;
+        std::string status;
+    };
+
+    StatusStruct StatusInfo;
+
+    void refreshStatusInfo(ProcessGroupHCCL::WorkHCCL work, std::string status);
+
+    static std::unordered_map<std::string, StatusStruct> StatusOutput_;
+
+    std::mutex StatusMapmutex_;
+
+    void updateStatusOutput();
+
+    bool recordHcclStatus(const std::string path, bool end = false, bool error = false);
+
+    static int deviceId_;
+
+    static int numRanks_;
+
+    static std::string exceptionMessage_;
 
 private:
     // Helper that encapsulates work shared across all collective communication

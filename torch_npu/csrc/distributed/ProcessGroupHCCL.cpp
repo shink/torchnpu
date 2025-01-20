@@ -28,10 +28,12 @@
 #include "torch_npu/csrc/core/npu/NPUAffinityController.h"
 #include "torch_npu/csrc/core/npu/NPUStream.h"
 #include "torch_npu/csrc/core/npu/register/OptionsManager.h"
+#include "torch_npu/csrc/core/npu/interface/OpInterface.h"
 #include "torch_npu/csrc/distributed/HCCLUtils.hpp"
 #include "torch_npu/csrc/distributed/HcclCompile.h"
 #include "torch_npu/csrc/distributed/ProcessGroupHCCL.hpp"
 #include "torch_npu/csrc/toolkit/profiler/common/utils.h"
+#include "torch_npu/csrc/framework/OpHook.h"
 #include "torch_npu/csrc/framework/FormatHelper.h"
 #include "torch_npu/csrc/framework/utils/OpPreparation.h"
 #include "torch_npu/csrc/profiler/npu_profiler.h"
@@ -68,6 +70,8 @@ bool nslb_is_end = false;
 bool uce_error_flag = false;
 bool force_stop_error_flag = false;
 char* nslb_path = c10_npu::option::OptionsManager::GetNslbPath();
+bool status_save_enable = c10_npu::option::OptionsManager::CheckStatusSaveEnable();
+std::string status_save_path = c10_npu::option::OptionsManager::GetStatusSavePath();
 
 inline c10_npu::NPUStream getNPUStreamByCurrentType(c10::DeviceIndex device = -1)
 {
@@ -263,6 +267,56 @@ void checkHcclCommConfigValid(const HcclCommConfig* config)
                     DIST_ERROR(ErrCode::NOT_SUPPORT));
     }
 }
+
+void fill_equal_split_sizes_when_empty(std::vector<int64_t>& split_sizes, at::Tensor tensor, int group_size)
+{
+    if (!split_sizes.empty()) {
+        return;
+    }
+    TORCH_CHECK(group_size > 0, "Invalid group size within current process group", group_size, DIST_ERROR(ErrCode::PARAM));
+    TORCH_CHECK(
+        tensor.size(0) % group_size == 0,
+        "Tensor's dim 0 does not divide equally across group size",
+        DIST_ERROR(ErrCode::PARAM));
+    int64_t equal_split_size = static_cast<int64_t>(tensor.size(0) / group_size);
+    for (int i = 0; i < group_size; i++) {
+        split_sizes.push_back(equal_split_size);
+    }
+}
+
+void check_split_sizes(const std::vector<int64_t>& split_sizes, const at::Tensor& tensor, int group_size)
+{
+    if (split_sizes.empty()) {
+        TORCH_CHECK(tensor.size(0) % group_size == 0, "Tensor's dim 0 does not divide equally across group size",
+                    DIST_ERROR(ErrCode::PARAM));
+    } else {
+        TORCH_CHECK(
+            split_sizes.size() == static_cast<size_t>(group_size), "Number of tensor splits not equal to group size",
+            DIST_ERROR(ErrCode::TYPE));
+        const auto sum = c10::sum_integers(split_sizes);
+        TORCH_CHECK(sum == tensor.size(0), "Split sizes dosen't match total dim 0 size", DIST_ERROR(ErrCode::TYPE));
+    }
+}
+
+void checkAndMakePath(const char* path, std::string errormessage)
+{
+    try {
+        if (access(path, W_OK) != 0 && mkdir(path, S_IRWXU | S_IRGRP | S_IXGRP) != 0) {
+            throw std::exception();
+        }
+    } catch (std::exception& e) {
+        throw std::runtime_error(errormessage + DIST_ERROR(ErrCode::NOT_FOUND));
+    }
+}
+
+void createFile(const char* path)
+{
+    int fd = open(path, O_WRONLY | O_CREAT, S_IRUSR | S_IWUSR | S_IRGRP);
+    if (fd == -1) {
+        throw std::runtime_error("Create file failed. Please check whether input file is valid." + DIST_ERROR(ErrCode::NOT_FOUND));
+    }
+    close(fd);
+}
 } // namespace
 
 constexpr int64_t kSynchronizeBusyWaitMillis = 10;
@@ -272,6 +326,10 @@ thread_local uint64_t ProcessGroupHCCL::hcclActiveGroupCounter_ = 0;
 const int64_t ProcessGroupHCCL::kWatchdogThreadSleepMillis = 1000;
 std::string ProcessGroupHCCL::perfdumppath = "";
 ProcessGroupHCCL* ProcessGroupHCCL::global_ = nullptr;
+std::unordered_map<std::string, ProcessGroupHCCL::StatusStruct> ProcessGroupHCCL::StatusOutput_;
+int ProcessGroupHCCL::deviceId_ = -1;
+int ProcessGroupHCCL::numRanks_ = -1;
+std::string ProcessGroupHCCL::exceptionMessage_ = "";
 
 std::ostream& operator<<(std::ostream& output, const ProcessGroupHCCL::WorkHCCL& workHCCL)
 {
@@ -301,7 +359,7 @@ ProcessGroupHCCL::WorkHCCL::WorkHCCL(
     // Creates the npu event wrappers
     // Note: The actual events are lazily created when first recorded to with
     // DEFAULT_FLAGS = npuEventDisableTiming.
-    if (desyncDebug) {
+    if (desyncDebug || (status_save_enable)) {
         hcclStartEvents_ = std::make_shared<std::vector<c10_npu::NPUEvent>>();
         hcclStartEvents_->reserve(devices.size());
         for (int i = 0; i < devices.size(); i++) {
@@ -341,8 +399,8 @@ bool ProcessGroupHCCL::WorkHCCL::isCompleted()
 }
 
 bool ProcessGroupHCCL::WorkHCCL::isStarted() {
-  checkAndSetException();
-  return exception() || startedNPUExecutionInternal();
+    checkAndSetException();
+    return exception() || startedNPUExecutionInternal();
 }
 
 bool ProcessGroupHCCL::WorkHCCL::isSuccess() const
@@ -434,7 +492,7 @@ bool ProcessGroupHCCL::WorkHCCL::finishedNPUExecutionInternal() const
         LOG(INFO) << "[Rank " << rank_ << "] Event query failed with exception: " << e.what();
     }
 
-  return true;
+    return true;
 }
 
 bool ProcessGroupHCCL::WorkHCCL::checkTimeout(c10::optional<std::chrono::milliseconds> timeout)
@@ -606,6 +664,10 @@ void ProcessGroupHCCL::WorkHCCL::synchronizeInternal(std::chrono::milliseconds t
             handleException(TearDown);
         }
     }
+
+    if (C10_UNLIKELY(at_npu::native::env::CheckOpHookEnable())) {
+        at_npu::native::OpHook::GetInstance().PostHook();
+    }
 }
 
 void ProcessGroupHCCL::WorkHCCL::lazyDestroy(std::vector<at::Tensor> tensors)
@@ -719,13 +781,13 @@ ProcessGroupHCCL::ProcessGroupHCCL(
     if (asyncErrorHandling_ == TearDown) {
         if (hccl_exec_timeout > 0) {
             if ((hccl_exec_timeout * 1000) > (options_->timeout).count()) {
-                TORCH_NPU_WARN("The HCCL execution timeout ", hccl_exec_timeout*1000, "ms is bigger than watchdog timeout ",
+                TORCH_NPU_WARN("The HCCL execution timeout ", hccl_exec_timeout * 1000, "ms is bigger than watchdog timeout ",
                     (options_->timeout).count(), "ms which is set by init_process_group! The plog may not be recorded.");
             }
         } else {
             if ((options_->timeout).count() == DEFAULT_TIMEOUT) {
                 // Only when the timeout is default, we will change it.
-                options_->timeout = std::chrono::milliseconds(DEFAULT_TIMEOUT*2);
+                options_->timeout = std::chrono::milliseconds(DEFAULT_TIMEOUT * 2);
             }
             if ((options_->timeout).count() < DEFAULT_TIMEOUT) {
                 TORCH_NPU_WARN("The HCCL execution timeout 1800000ms is bigger than watchdog timeout ",
@@ -794,6 +856,8 @@ void ProcessGroupHCCL::abort(c10::optional<std::string> abortReason)
 void ProcessGroupHCCL::deleteTCPStoreKey()
 {
     try {
+        // all processes in a group may be killed, so delete key 0 as a last resort
+        store_->deleteKey("0");
         for (const auto &key : TCPStoreKeyList_) {
             store_->deleteKey(key);
         }
@@ -860,6 +924,12 @@ void ProcessGroupHCCL::hcclCommWatchdog()
             "] HCCL watchdog thread terminated with exception: ",
             e.what());
         LOG(ERROR) << exitMsg;
+        if (status_save_enable) {
+            if (exceptionMessage_.empty()) {
+                exceptionMessage_ = e.what();
+            }
+            recordHcclStatus(status_save_path, true, true);
+        }
         watchDogException_ = std::make_exception_ptr(std::runtime_error(exitMsg));
         std::rethrow_exception(watchDogException_);
     } catch (...) {
@@ -868,6 +938,9 @@ void ProcessGroupHCCL::hcclCommWatchdog()
             rank_,
             "] HCCL watchdog thread terminated with exception: unknown");
         LOG(ERROR) << exitMsg;
+        if (status_save_enable) {
+            recordHcclStatus(status_save_path, true);
+        }
         watchDogException_ = std::make_exception_ptr(std::runtime_error(exitMsg));
         std::rethrow_exception(watchDogException_);
     }
@@ -915,7 +988,18 @@ void ProcessGroupHCCL::workCleanupLoop()
 {
     bool needSetDevice = true;
     std::list<ProcessGroupHCCL::WorkHCCL> completedWorkList;
+    auto lastrecordtime = std::chrono::steady_clock::now();
+    auto timenow = std::chrono::steady_clock::now();
+    bool recordflag = false;
+    
     while (!terminateProcessGroup_.load()) {
+        if (status_save_enable) {
+            checkAndMakePath(status_save_path.c_str(), "Open shared directory failed. Please check whether input path is valid.");
+            timenow = std::chrono::steady_clock::now();
+            recordflag = (std::chrono::duration_cast<std::chrono::milliseconds>(timenow - lastrecordtime).count() > (c10_npu::option::OptionsManager::GetStatusSaveInterval() * 1000));
+        }
+
+        {
         std::unique_lock<std::mutex> lock(workMetaListMutex_);
         // We busy-poll the work vector every kWatchdogThreadSleepMillis
         // milliseconds as long as the atomic is True.
@@ -933,6 +1017,7 @@ void ProcessGroupHCCL::workCleanupLoop()
                     c10::DeviceIndex device = static_cast<int>(work.devices_[0].index());
                     c10_npu::SetThreadAffinity(device);
                     NPU_CHECK_ERROR(c10_npu::SetDevice(device));
+                    deviceId_ = static_cast<int>(work.devices_[0].index());
                     needSetDevice = false;
                 }
             } catch (const std::exception& e) {
@@ -983,15 +1068,34 @@ void ProcessGroupHCCL::workCleanupLoop()
                     ASCEND_LOGE("Process group work %s, seq_num %u dispatch sucess. This error log can be ignored.", opTypeToString(work.opType_).c_str(), work.seq_);
                     work.is_reported = false;
                 }
+                if (status_save_enable) {
+                    refreshStatusInfo(work, "end"); // Update Statusinfo，but not write into the map
+                }
                 it = workMetaList_.erase(it);
             } else {
+                if (status_save_enable && work.isStarted()) {
+                    refreshStatusInfo(work, "start"); // Update Statusinfo，but not write into the map
+                }
                 // Increment the iterator if the current WorkHCCL object is not
                 // completed.
                 ++it;
             }
         }
+        }
+
+        if (recordflag && recordHcclStatus(status_save_path)) {
+            lastrecordtime = std::chrono::steady_clock::now();
+        }
     }
+
+    if (status_save_enable) {
+        recordHcclStatus(status_save_path);
+    }
+
     if (terminateProcessGroup_.load()) {
+        if (status_save_enable) {
+            recordHcclStatus(status_save_path, true);
+        }
         std::unique_lock<std::mutex> lock(workMetaListMutex_);
         workMetaList_.clear();
     }
@@ -1105,6 +1209,13 @@ void ProcessGroupHCCL::recordDataVol(std::string opName, const std::string dataV
         if (access(nslb_path, W_OK) != 0 && mkdir(nslb_path, S_IRWXU | S_IRGRP | S_IXGRP) != 0) {
             throw std::exception();
         }
+        if (access(out_file_path.c_str(), W_OK) != 0) {
+            int fd = open(out_file_path.c_str(), O_WRONLY | O_CREAT, S_IRUSR | S_IWUSR | S_IRGRP);
+            if (fd == -1) {
+                throw std::exception();
+            }
+            close(fd);
+        }
         outfile.open(out_file_path, std::ios::app);
     } catch (std::exception& e) {
         throw std::runtime_error("Open shared directory failed. Please check whether input path is valid." + DIST_ERROR(ErrCode::NOT_FOUND));
@@ -1115,6 +1226,87 @@ void ProcessGroupHCCL::recordDataVol(std::string opName, const std::string dataV
     }
     outfile << opName << " " << dataVol << " " << std::to_string(currRank) << "\n";
     outfile.close();
+}
+
+void ProcessGroupHCCL::refreshStatusInfo(ProcessGroupHCCL::WorkHCCL work, std::string status)
+{
+    StatusInfo.seq = work.seq_;
+    StatusInfo.pgId = options_->group_id;
+    StatusInfo.opType = opTypeToString(work.opType_);
+    if (StatusInfo.commIds == "") {
+        for (auto i : options_->global_ranks_in_group) {
+            StatusInfo.commIds += (std::to_string(i) + " ");
+        }
+    }
+    if (StatusInfo.commIds == "") {
+        StatusInfo.commIds = "all";
+    }
+    StatusInfo.status = status;
+}
+
+void ProcessGroupHCCL::updateStatusOutput()
+{
+    if (!StatusInfo.pgId.empty()) {
+        StatusOutput_[options_->group_id] = StatusInfo;
+    }
+}
+
+bool ProcessGroupHCCL::recordHcclStatus(const std::string path, bool end, bool error)
+{
+    std::unique_lock<std::mutex> lock(StatusMapmutex_);
+    updateStatusOutput();
+    if (!options_->global_ranks_in_group.empty() && !error) {
+        return true;
+    } else if (!StatusOutput_.empty()) {
+        static auto pid = getpid();
+        static std::chrono::time_point<std::chrono::system_clock> firstrecordtime = std::chrono::system_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(firstrecordtime.time_since_epoch()).count();
+        auto end_duration = duration;
+        if (end) {
+            static std::chrono::time_point<std::chrono::system_clock> endrecordtime = std::chrono::system_clock::now();
+            end_duration = std::chrono::duration_cast<std::chrono::milliseconds>(endrecordtime.time_since_epoch()).count();
+        }
+        std::ofstream outfile;
+        std::stringstream fileName;
+        static auto master_addr = getenv("MASTER_ADDR");
+        if (master_addr == nullptr) {
+            master_addr = "127.0.0.1";
+            ASCEND_LOGW("Unable to fetch master IP addr, environment variable is null, it will use 127.0.0.1");
+        }
+        int global_rank = rank_;
+        if (!options_->global_ranks_in_group.empty()) {
+            global_rank = options_->global_ranks_in_group[rank_];
+        }
+        fileName << "torch_hccl_status-" << std::to_string(global_rank) << "_" << master_addr << "_" << std::to_string(deviceId_) << "_";
+        fileName << std::to_string(numRanks_) << "_" << std::to_string(pid) << "_" << std::to_string(duration) << ".log";
+        std::string isMaster = "false";
+        if (global_rank == 0) {
+            isMaster = "true";
+        }
+        std::string out_file_path = c10::str(path, "/", fileName.str());
+        checkAndMakePath(path.c_str(), "Open shared directory failed. Please check whether input path is valid.");
+        createFile(out_file_path.c_str());
+        outfile.open(out_file_path.c_str(), std::ios::trunc);
+        outfile << "{\"last_comm_op\":[";
+        bool first_op = true;
+        for (auto info = StatusOutput_.begin(); info != StatusOutput_.end(); info++) {
+            if (first_op) {
+                outfile << "{";
+            } else {
+                outfile << ", {";
+            }
+            outfile << "\"seq\":" << info->second.seq << ", \"op_type\":\"" << info->second.opType;
+            outfile << "\", \"pg_id\":" << info->second.pgId << ", \"comm_ids\":\"" << info->second.commIds;
+            outfile << "\", \"status\":\""<< info->second.status << "\"}";
+            first_op = false;
+        }
+        outfile << "], \"is_master\":" << isMaster;
+        outfile << ", \"exception_message\":\"" << exceptionMessage_;
+        outfile << "\", \"global_pg_end_time\":" << end_duration << "}" << std::endl;
+        outfile.close();
+        return true;
+    }
+    return false;
 }
 
 void ProcessGroupHCCL::recordComm(std::string filename, std::string opName, const int currRank, std::vector<std::shared_ptr<HCCLComm>>& hcclComms)
@@ -1575,8 +1767,13 @@ void nslb_record_end()
         if (access(nslb_path, W_OK) != 0 && mkdir(nslb_path, S_IRWXU | S_IRGRP | S_IXGRP) != 0) {
             throw std::exception();
         }
-        endfile.open(end_file_path.c_str(), std::ios::out);
-        endfile.close();
+        if (access(end_file_path.c_str(), W_OK) != 0) {
+            int fd = open(end_file_path.c_str(), O_WRONLY | O_CREAT, S_IRUSR | S_IWUSR | S_IRGRP);
+            if (fd == -1) {
+                throw std::exception();
+            }
+            close(fd);
+        }
     } catch (std::exception& e) {
         throw std::runtime_error("NSLB set end failed." + DIST_ERROR(ErrCode::NOT_FOUND));
     }
@@ -1820,17 +2017,34 @@ void ProcessGroupHCCL::silenceCheck(at::Tensor &input, c10d::OpType opType)
             return;
         }
     }
-    if (silenceCheckCache_.find(opType) == silenceCheckCache_.end()) {
-        at::Tensor stepTensor = at::zeros({1}, input.options().dtype(at::kLong));
-        at::Tensor cacheTensor = at::zeros({3}, input.options().dtype(at::kFloat));
-        silenceCheckCache_.emplace(opType, std::make_pair(std::move(stepTensor), std::move(cacheTensor)));
+    if (c10_npu::opapi::IsExistAclnnSilentCheckV2()) {
+        at::Tensor val = input.detach().pow(2).max().view(-1);
+        at::Tensor max;
+        if (silenceCheckCache_.find(opType) == silenceCheckCache_.end()) {
+            at::Tensor stepTensor = at::zeros({1}, input.options().dtype(at::kLong));
+            at::Tensor avg = input.detach().pow(2).max().view(-1);
+            max = avg;
+            silenceCheckCache_.emplace(opType, std::make_pair(std::move(stepTensor), std::move(avg)));
+        } else {
+            max = val;
+        }
+        static double beta1 = 0.99;
+        op_plugin::_npu_silent_check_v3(val, input, silenceCheckCache_[opType].first, max, silenceCheckCache_[opType].second,
+            c10_npu::option::OptionsManager::GetSilenceUpperThresh().first, c10_npu::option::OptionsManager::GetSilenceUpperThresh().second,
+            beta1, static_cast<int64_t>(c10_npu::option::OptionsManager::GetSilenceCheckFlag()));
+    } else {
+        if (silenceCheckCache_.find(opType) == silenceCheckCache_.end()) {
+            at::Tensor stepTensor = at::zeros({1}, input.options().dtype(at::kLong));
+            at::Tensor cacheTensor = at::zeros({3}, input.options().dtype(at::kFloat));
+            silenceCheckCache_.emplace(opType, std::make_pair(std::move(stepTensor), std::move(cacheTensor)));
+        }
+        at::Tensor val = at::norm(input);
+        static double min_steps = 100.0;
+        op_plugin::_npu_silent_check_v2(val, input, silenceCheckCache_[opType].second, silenceCheckCache_[opType].first, min_steps,
+            c10_npu::option::OptionsManager::GetSilenceUpperThresh().first, c10_npu::option::OptionsManager::GetSilenceSigmaThresh().first,
+            c10_npu::option::OptionsManager::GetSilenceUpperThresh().second, c10_npu::option::OptionsManager::GetSilenceSigmaThresh().second,
+            static_cast<int64_t>(c10_npu::option::OptionsManager::GetSilenceCheckFlag()));
     }
-    at::Tensor val = at::norm(input);
-    static double min_steps = 100.0;
-    op_plugin::_npu_silent_check_v2(val, input, silenceCheckCache_[opType].second, silenceCheckCache_[opType].first, min_steps,
-        c10_npu::option::OptionsManager::GetSilenceUpperThresh().first, c10_npu::option::OptionsManager::GetSilenceSigmaThresh().first,
-        c10_npu::option::OptionsManager::GetSilenceUpperThresh().second, c10_npu::option::OptionsManager::GetSilenceSigmaThresh().second,
-        static_cast<int64_t>(c10_npu::option::OptionsManager::GetSilenceCheckFlag()));
 }
 
 HcclCommConfig ProcessGroupHCCL::createHcclCommConfigWithOptions()
@@ -1889,7 +2103,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupHCCL::collective(
     work->outputs_ = std::make_shared<std::vector<at::Tensor>>(outputs);
     c10_npu::OptionalNPUGuard npuGuard;
 
-    if (desyncDebug_) {
+    if (desyncDebug_ || status_save_enable) {
         for (const auto i : c10::irange(devices.size())) {
             c10_npu::NPUStream& hcclStream = hcclStreams[i];
             (*(work->hcclStartEvents_))[i].record(hcclStream);
@@ -2393,6 +2607,11 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupHCCL::allreduce(
     const c10d::AllreduceOptions& opts)
 {
     check_npu_tensors_different_devices(tensors);
+
+    if (C10_UNLIKELY(at_npu::native::env::CheckOpHookEnable())) {
+        at_npu::native::OpHook::GetInstance().PreHook("allreduce", tensors);
+    }
+
     std::vector<at::Tensor> tensors_cp = {tensors[0]};
     std::string functionName = __FUNCTION__;
     return collective(
@@ -2440,6 +2659,10 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupHCCL::batch_isend_irecv(
     std::vector<at::Tensor>& tensors,
     std::vector<uint32_t> remote_rank_list)
 {
+    if (C10_UNLIKELY(at_npu::native::env::CheckOpHookEnable())) {
+        at_npu::native::OpHook::GetInstance().PreHook("batch_isend_irecv", tensors);
+    }
+
     std::vector<at::Tensor> tensors_tmp = {tensors[0]};
     return collective(
         tensors_tmp,
@@ -2505,6 +2728,11 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupHCCL::broadcast(
     const c10d::BroadcastOptions& opts)
 {
     check_npu_tensors_different_devices(tensors);
+
+    if (C10_UNLIKELY(at_npu::native::env::CheckOpHookEnable())) {
+        at_npu::native::OpHook::GetInstance().PreHook("broadcast", tensors);
+    }
+
     return collective(
         tensors,
         tensors,
@@ -2588,6 +2816,11 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupHCCL::reduce(
     const c10d::ReduceOptions& opts)
 {
     check_npu_tensors_different_devices(tensors);
+
+    if (C10_UNLIKELY(at_npu::native::env::CheckOpHookEnable())) {
+        at_npu::native::OpHook::GetInstance().PreHook("reduce", tensors);
+    }
+
     std::string functionName = __FUNCTION__;
     uint64_t rank = opts.rootRank;
     std::vector<at::Tensor> tensors_cp = {tensors[0]};
@@ -2716,12 +2949,174 @@ at::Tensor ProcessGroupHCCL::byte_alignment(at::Tensor& tensors)
     return inter_tensors;
 }
 
+c10::intrusive_ptr<c10d::Work> ProcessGroupHCCL::_reduce_scatter_base_uneven(
+    at::Tensor& outputTensor,
+    at::Tensor& inputTensor,
+    std::vector<int64_t>& inputSplitSizes,
+    const c10d::ReduceScatterOptions& opts)
+{
+    check_npu_single_tensor(outputTensor);
+    check_npu_single_tensor(inputTensor);
+    TORCH_CHECK(inputTensor.dtype() == outputTensor.dtype(), "output tensor must have the same type as input tensor", DIST_ERROR(ErrCode::PARAM));
+    std::vector<at::Tensor> inputTensors = {inputTensor};
+    std::vector<at::Tensor> outputTensors = {outputTensor};
+    check_npu_tensors_different_devices(inputTensors);
+    check_npu_tensors_different_devices(outputTensors);
+
+    fill_equal_split_sizes_when_empty(inputSplitSizes, inputTensor, size_);
+    check_split_sizes(inputSplitSizes, inputTensor, size_);
+
+    int inputSize = static_cast<int>(inputSplitSizes.size());
+    int inputRowSize = static_cast<int>(inputTensor.size(0) ? inputTensor.numel() / inputTensor.size(0) : 1);
+    std::vector<uint64_t> inputCounts;
+    std::vector<uint64_t> inputSpl;
+    inputSpl.push_back(0);
+    for (int i = 0; i < inputSize; i++) {
+        inputCounts.push_back(static_cast<uint64_t>(inputSplitSizes[i] * inputRowSize));
+        if (i > 0) {
+            inputSpl.push_back(inputSpl[i - 1] + inputCounts[i - 1]);
+        }
+    }
+
+    auto inputTensors_ = cast_to_origin_format(inputTensors);
+    auto outputTensors_ = cast_to_origin_format(outputTensors);
+
+    return collective(
+        inputTensors_,
+        outputTensors_,
+        [&](at::Tensor& input, at::Tensor& output, HcclComm comm, c10_npu::NPUStream& stream, std::shared_ptr<bool> is_dispatched) {
+            RECORD_FUNCTION("HcclReduceScatterV", std::vector<c10::IValue>({input}));
+            auto inputDataPtr = input.data_ptr();
+            auto outputDataPtr = output.data_ptr();
+            uint64_t outputCount = output.numel();
+            auto numel = getNumelForHCCL(output);
+            auto hcclReduceOp = getHcclReduceOp(opts.reduceOp, input);
+            auto hcclType = getHcclDataType(input.scalar_type());
+            auto hccl_call = [
+                inputDataPtr,
+                inputCounts,
+                inputSpl,
+                outputDataPtr,
+                outputCount,
+                hcclType,
+                hcclReduceOp,
+                numel,
+                comm,
+                stream,
+                is_dispatched]() -> int {
+                    torch_npu::profiler::MstxRange range(
+                        getMstxHcclMsg("HcclReduceScatterV", numel, hcclType, comm),
+                        stream.stream(false));
+                    auto hccl_result = hcclReduceScatterV(
+                        inputDataPtr,
+                        inputCounts.data(),
+                        inputSpl.data(),
+                        outputDataPtr,
+                        outputCount,
+                        hcclType,
+                        hcclReduceOp,
+                        comm,
+                        stream.stream(false));
+                    *is_dispatched = true;
+                    return hccl_result;
+            };
+            at_npu::native::OpCommand::RunOpApi("HcclReduceScatterV", hccl_call);
+
+            return HCCL_SUCCESS;
+        },
+        [&](std::vector<c10_npu::NPUStream>&, c10::intrusive_ptr<ProcessGroupHCCL::WorkHCCL>&) {},
+        [&](std::vector<c10_npu::NPUStream>&, c10::intrusive_ptr<ProcessGroupHCCL::WorkHCCL>&) {},
+        c10d::OpType::REDUCE_SCATTER);
+}
+
+c10::intrusive_ptr<c10d::Work> ProcessGroupHCCL::_allgather_base_uneven(
+    at::Tensor& outputTensor,
+    at::Tensor& inputTensor,
+    std::vector<int64_t>& outputSplitSizes,
+    const c10d::AllgatherOptions& opts)
+{
+    check_npu_single_tensor(outputTensor);
+    check_npu_single_tensor(inputTensor);
+    TORCH_CHECK(inputTensor.dtype() == outputTensor.dtype(), "output tensor must have the same type as input tensor", DIST_ERROR(ErrCode::PARAM));
+    std::vector<at::Tensor> inputTensors = {inputTensor};
+    std::vector<at::Tensor> outputTensors = {outputTensor};
+    check_npu_tensors_different_devices(inputTensors);
+    check_npu_tensors_different_devices(outputTensors);
+
+    fill_equal_split_sizes_when_empty(outputSplitSizes, outputTensor, size_);
+    check_split_sizes(outputSplitSizes, outputTensor, size_);
+
+    int outputSize = static_cast<int>(outputSplitSizes.size());
+    int outputRowSize = static_cast<int>(outputTensor.size(0) ? outputTensor.numel() / outputTensor.size(0) : 1);
+    std::vector<uint64_t> outputCounts;
+    std::vector<uint64_t> outputSpl;
+    outputSpl.push_back(0);
+    for (int i = 0; i < outputSize; i++) {
+        outputCounts.push_back(static_cast<uint64_t>(outputSplitSizes[i] * outputRowSize));
+        if (i > 0) {
+            outputSpl.push_back(outputSpl[i - 1] + outputCounts[i - 1]);
+        }
+    }
+
+    auto inputTensors_ = cast_to_origin_format(inputTensors);
+    auto outputTensors_ = cast_to_origin_format(outputTensors);
+
+    return collective(
+        inputTensors_,
+        outputTensors_,
+        [&](at::Tensor& input, at::Tensor& output, HcclComm comm, c10_npu::NPUStream& stream, std::shared_ptr<bool> is_dispatched) {
+            RECORD_FUNCTION("HcclAllGatherV", std::vector<c10::IValue>({input}));
+            auto inputDataPtr = input.data_ptr();
+            uint64_t inputCount = input.numel();
+            auto outputDataPtr = output.data_ptr();
+            auto numel = getNumelForHCCL(input);
+            auto hcclType = getHcclDataType(input.scalar_type());
+            auto hccl_call = [
+                inputDataPtr,
+                inputCount,
+                outputDataPtr,
+                outputCounts,
+                outputSpl,
+                hcclType,
+                numel,
+                comm,
+                stream,
+                is_dispatched]() -> int {
+                    torch_npu::profiler::MstxRange range(
+                        getMstxHcclMsg("HcclAllGatherV", numel, hcclType, comm),
+                        stream.stream(false));
+                    auto hccl_result = hcclAllGatherV(
+                        inputDataPtr,
+                        inputCount,
+                        outputDataPtr,
+                        outputCounts.data(),
+                        outputSpl.data(),
+                        hcclType,
+                        comm,
+                        stream.stream(false));
+                    *is_dispatched = true;
+                    return hccl_result;
+            };
+            at_npu::native::OpCommand::RunOpApi("HcclAllGatherV", hccl_call);
+
+            return HCCL_SUCCESS;
+        },
+        [&](std::vector<c10_npu::NPUStream>&, c10::intrusive_ptr<ProcessGroupHCCL::WorkHCCL>&) {},
+        [&](std::vector<c10_npu::NPUStream>&, c10::intrusive_ptr<ProcessGroupHCCL::WorkHCCL>&) {},
+        c10d::OpType::ALLGATHER);
+}
+
 c10::intrusive_ptr<c10d::Work> ProcessGroupHCCL::allgather(
     std::vector<std::vector<at::Tensor>>& outputTensors,
     std::vector<at::Tensor>& inputTensors,
     const c10d::AllgatherOptions& opts)
 {
     check_npu_tensors_different_devices(inputTensors);
+
+    if (C10_UNLIKELY(at_npu::native::env::CheckOpHookEnable())) {
+        at_npu::native::OpHook::GetInstance().PreHook("allgather", outputTensors, inputTensors);
+    }
+
     auto inputTensors_ = cast_to_origin_format(inputTensors);
     bool same_size = check_same_size(outputTensors.back());
     if (same_size) {
@@ -2889,6 +3284,11 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupHCCL::allgather_togather(
 {
     check_npu_tensors_different_devices(inputTensors);
     check_npu_tensors_different_devices(outputTensors);
+
+    if (C10_UNLIKELY(at_npu::native::env::CheckOpHookEnable())) {
+        at_npu::native::OpHook::GetInstance().PreHook("allgather_togather", outputTensors, inputTensors);
+    }
+
     auto inputTensors_ = cast_to_origin_format(inputTensors);
 
     return collective(
@@ -2934,6 +3334,11 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupHCCL::_allgather_base(
     std::vector<at::Tensor> outputTensors = {outputTensor};
     check_npu_tensors_different_devices(inputTensors);
     check_npu_tensors_different_devices(outputTensors);
+
+    if (C10_UNLIKELY(at_npu::native::env::CheckOpHookEnable())) {
+        at_npu::native::OpHook::GetInstance().PreHook("_allgather_base", outputTensors, inputTensors);
+    }
+
     auto inputTensors_ = cast_to_origin_format(inputTensors);
 
     return collective(
@@ -2970,6 +3375,11 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupHCCL::reduce_scatter(
     const c10d::ReduceScatterOptions& opts)
 {
     check_npu_tensors_different_devices(outputTensors);
+
+    if (C10_UNLIKELY(at_npu::native::env::CheckOpHookEnable())) {
+        at_npu::native::OpHook::GetInstance().PreHook("reduce_scatter", outputTensors, inputTensors);
+    }
+
     bool same_size = check_same_size(inputTensors.back());
     if (same_size) {
         auto inputFlattened = flatten_for_scatter_gather(inputTensors, outputTensors, size_);
@@ -3066,6 +3476,11 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupHCCL::_reduce_scatter_base(
 
     auto inputs = std::vector<at::Tensor>{inputTensor};
     auto outputs = std::vector<at::Tensor>{outputTensor};
+
+    if (C10_UNLIKELY(at_npu::native::env::CheckOpHookEnable())) {
+        at_npu::native::OpHook::GetInstance().PreHook("_reduce_scatter_base", outputs, inputs);
+    }
+
     std::string functionName = __FUNCTION__;
     return collective(
         inputs,
@@ -3217,6 +3632,10 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupHCCL::scatter(
         }
     }
 
+    if (C10_UNLIKELY(at_npu::native::env::CheckOpHookEnable())) {
+        at_npu::native::OpHook::GetInstance().PreHook("scatter", outputTensors, inputTensors);
+    }
+
     std::vector<at::Tensor> inputFlattened;
     if (getRank() == opts.rootRank) {
         inputFlattened = flatten_for_scatter_gather(inputTensors, outputTensors, size_);
@@ -3280,6 +3699,11 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupHCCL::scatter(
 c10::intrusive_ptr<c10d::Work> ProcessGroupHCCL::send(std::vector<at::Tensor>& tensors, int dstRank, int tag)
 {
     check_npu_tensors_different_devices(tensors);
+
+    if (C10_UNLIKELY(at_npu::native::env::CheckOpHookEnable())) {
+        at_npu::native::OpHook::GetInstance().PreHook("send", tensors);
+    }
+
     auto tensors_ = cast_to_origin_format(tensors);
     auto ret = pointToPoint(
         tensors_,
@@ -3306,6 +3730,11 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupHCCL::send(std::vector<at::Tensor>& t
 c10::intrusive_ptr<c10d::Work> ProcessGroupHCCL::recv(std::vector<at::Tensor>& tensors, int srcRank, int tag)
 {
     check_npu_tensors_different_devices(tensors);
+
+    if (C10_UNLIKELY(at_npu::native::env::CheckOpHookEnable())) {
+        at_npu::native::OpHook::GetInstance().PreHook("recv", tensors);
+    }
+
     auto tensors_ = create_base_format_tensors(tensors);
     auto ret = pointToPoint(
         tensors_,
@@ -3357,20 +3786,6 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupHCCL::recvAnysource(std::vector<at::T
     TORCH_CHECK(false, "ProcessGroupHCCL does not support recv", DIST_ERROR(ErrCode::NOT_SUPPORT));
 }
 
-void check_split_sizes(const std::vector<int64_t>& split_sizes, const at::Tensor& tensor, int group_size)
-{
-    if (split_sizes.empty()) {
-        TORCH_CHECK(tensor.size(0) % group_size == 0, "Tensor's dim 0 does not divide equally across group size",
-                    DIST_ERROR(ErrCode::PARAM));
-    } else {
-        TORCH_CHECK(
-            split_sizes.size() == static_cast<size_t>(group_size), "Number of tensor splits not equal to group size",
-            DIST_ERROR(ErrCode::TYPE));
-        const auto sum = c10::sum_integers(split_sizes);
-        TORCH_CHECK(sum == tensor.size(0), "Split sizes dosen't match total dim 0 size", DIST_ERROR(ErrCode::TYPE));
-    }
-}
-
 c10::intrusive_ptr<c10d::Work> ProcessGroupHCCL::alltoall_base(
     at::Tensor& outputTensor,
     at::Tensor& inputTensor,
@@ -3384,6 +3799,11 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupHCCL::alltoall_base(
     TORCH_CHECK(ranks > 0, "Invalid rank count within current process group", ranks, DIST_ERROR(ErrCode::PARAM));
     std::vector<at::Tensor> inputTensors = {inputTensor};
     std::vector<at::Tensor> outputTensors = {outputTensor};
+
+    if (C10_UNLIKELY(at_npu::native::env::CheckOpHookEnable())) {
+        at_npu::native::OpHook::GetInstance().PreHook("alltoall_base", outputTensors, inputTensors);
+    }
+
     auto inputTensors_ = cast_to_origin_format(inputTensors);
     auto outputTensors_ = cast_to_origin_format(outputTensors);
 
@@ -3577,6 +3997,11 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupHCCL::alltoall(
         TORCH_CHECK(device == output_tensors[r].device() && device == input_tensors[r].device(),
             "tensors must be on the same device", DIST_ERROR(ErrCode::PARAM));
     }
+
+    if (C10_UNLIKELY(at_npu::native::env::CheckOpHookEnable())) {
+        at_npu::native::OpHook::GetInstance().PreHook("alltoall", output_tensors, input_tensors);
+    }
+
     std::vector<int64_t> output_split_sizes;
     std::vector<int64_t> input_split_sizes;
     std::vector<at::Tensor> output_results;

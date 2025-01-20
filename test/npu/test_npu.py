@@ -241,7 +241,7 @@ class TestNpu(TestCase):
     def test_out_of_memory(self):
         tensor = torch.zeros(1024, device='npu')
 
-        with self.assertRaisesRegex(RuntimeError, "Tried to allocate 8000000000.00 GiB"):
+        with self.assertRaisesRegex(RuntimeError, "Tried to allocate more than 1EB memory"):
             torch.empty(1024 * 1024 * 1024 * 8000000000, dtype=torch.int8, device='npu')
 
         # ensure out of memory error doesn't disturb subsequent kernel
@@ -721,6 +721,35 @@ class TestNpu(TestCase):
     def test_get_allocator_backend(self):
         npu_allocator_name = torch.npu.get_allocator_backend()
         self.assertEqual(npu_allocator_name, "native")
+
+    def test_contiguous(self):
+        def run_once():
+            x = torch.randn(4, 3, 8, 8).npu()
+            x = x.permute(0, 2, 1, 3)
+            x = x.contiguous()
+            return x
+
+        with torch._subclasses.fake_tensor.FakeTensorMode():
+            y = run_once()
+            self.assertTrue(y.is_contiguous())
+
+        x = torch.randn(1, 16, 5, 5).npu()
+        self.assertTrue(x.is_contiguous())
+        stride = list(x.stride())
+        stride[0] = 20
+        # change the stride in dimension 0. the tensor is still contiguous because size[0] is 1
+        x.set_(x.storage(), 0, x.size(), stride)
+        self.assertTrue(x.is_contiguous())
+
+        x.contiguous(memory_format=torch.contiguous_format)
+        x.contiguous(memory_format=torch.preserve_format)
+
+        with self.assertRaisesRegex(RuntimeError, "ERR01007 OPS feature not supported"):
+            x.contiguous(memory_format=torch.channels_last)
+
+        with self.assertRaisesRegex(RuntimeError, "ERR01007 OPS feature not supported"):
+            x.contiguous(memory_format=torch.channels_last_3d)
+
 
 if __name__ == '__main__':
     run_tests()

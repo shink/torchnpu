@@ -64,7 +64,17 @@ const SocVersion& GetSocVersion()
 
 bool IsSupportInfNan()
 {
+    static bool default_support_inf_nan = ((GetSocVersion() >= SocVersion::Ascend910B1) &&
+        (GetSocVersion() < SocVersion::Ascend310B1)) ||
+        (GetSocVersion() >= SocVersion::Ascend910_9391);
     if (!c10_npu::option::OptionsManager::CheckInfNanModeEnable()) {
+        if (default_support_inf_nan && !c10_npu::option::OptionsManager::CheckInfNanModeForceDisable()) {
+            AT_ERROR("INF_NAN_MODE_ENABLE shouldn't be set to 0 on the current device. If you want to disable ",
+                "inf-nan mode, please export INF_NAN_MODE_FORCE_DISABLE=1");
+        }
+        return false;
+    }
+    if (c10_npu::option::OptionsManager::CheckInfNanModeForceDisable()) {
         return false;
     }
     if (c10_npu::acl::IsExistGetCannAttribute()) {
@@ -75,8 +85,7 @@ bool IsSupportInfNan()
         }();
         return supportInfNan;
     }
-    return ((GetSocVersion() >= SocVersion::Ascend910B1) && (GetSocVersion() < SocVersion::Ascend310B1)) ||
-        (GetSocVersion() >= SocVersion::Ascend910_9391);
+    return default_support_inf_nan;
 }
 
 bool IsBF16Supported()
